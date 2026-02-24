@@ -320,10 +320,10 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("Expected InClientBytes of 5, got %v\n", v.InClientBytes)
 		}
 		if v.OutClientMsgs != 1 {
-			t.Fatalf("Expected InClientMsgs of 1, got %v\n", v.InClientMsgs)
+			t.Fatalf("Expected OutClientMsgs of 1, got %v\n", v.OutClientMsgs)
 		}
 		if v.OutClientBytes != 5 {
-			t.Fatalf("Expected InClientBytes of 5, got %v\n", v.OutClientBytes)
+			t.Fatalf("Expected OutClientBytes of 5, got %v\n", v.OutClientBytes)
 		}
 		if v.Subscriptions <= 10 {
 			t.Fatalf("Expected Subscriptions of at least 10, got %v\n", v.Subscriptions)
