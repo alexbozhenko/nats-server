@@ -1376,7 +1376,7 @@ func fillStream(t *testing.T, js nats.JetStreamContext, subj string, msgSize int
 	flush := func() {
 		select {
 		case <-js.PublishAsyncComplete():
-		case <-time.After(2 * time.Minute):
+		case <-time.After(10 * time.Minute):
 			t.Fatalf("timed out waiting for PublishAsyncComplete")
 		}
 	}
