@@ -166,23 +166,31 @@ func collect(streams []string, in <-chan result, every time.Duration, store *[]r
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	window := map[string]*windowStats{}
+	cumLats := map[string][]time.Duration{}
+	cumErrs := map[string]int{}
+	cumTimeouts := map[string]int{}
 	for _, s := range streams {
 		window[s] = &windowStats{}
 	}
+	startedAt := time.Now()
+	stats := func(lats []time.Duration) (p50, p99, mx time.Duration) {
+		n := len(lats)
+		if n == 0 {
+			return 0, 0, 0
+		}
+		sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+		return lats[n*50/100], lats[(n*99)/100], lats[n-1]
+	}
 	emit := func() {
-		log.Printf("[%s] rolling window:", time.Now().Format("15:04:05"))
+		elapsed := time.Since(startedAt).Round(time.Second)
+		log.Printf("[%s] t=%s", time.Now().Format("15:04:05"), elapsed)
 		for _, s := range streams {
 			w := window[s]
-			sort.Slice(w.lats, func(i, j int) bool { return w.lats[i] < w.lats[j] })
-			n := len(w.lats)
-			var p50, p99, mx time.Duration
-			if n > 0 {
-				p50 = w.lats[n*50/100]
-				p99 = w.lats[(n*99)/100]
-				mx = w.lats[n-1]
-			}
-			log.Printf("  %-20s n=%4d errs=%2d p50=%-10s p99=%-10s max=%-10s",
-				s, n, w.errs, p50, p99, mx)
+			wP50, wP99, wMax := stats(w.lats)
+			cumP50, cumP99, cumMax := stats(cumLats[s])
+			log.Printf("  %-20s window: n=%4d errs=%2d p50=%-10s p99=%-10s max=%-10s  | cum: n=%6d errs=%4d timeout=%4d p50=%-10s p99=%-10s max=%-10s",
+				s, len(w.lats), w.errs, wP50, wP99, wMax,
+				len(cumLats[s]), cumErrs[s], cumTimeouts[s], cumP50, cumP99, cumMax)
 		}
 		for _, s := range streams {
 			window[s] = &windowStats{}
@@ -203,9 +211,14 @@ func collect(streams []string, in <-chan result, every time.Duration, store *[]r
 			}
 			if r.err != nil {
 				w.errs++
+				cumErrs[r.stream]++
+				if errors.Is(r.err, nats.ErrTimeout) || errors.Is(r.err, nats.ErrNoResponders) {
+					cumTimeouts[r.stream]++
+				}
 				continue
 			}
 			w.lats = append(w.lats, r.latency)
+			cumLats[r.stream] = append(cumLats[r.stream], r.latency)
 		case <-tick.C:
 			emit()
 		}
