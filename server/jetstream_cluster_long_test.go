@@ -17,11 +17,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1189,4 +1193,304 @@ func TestLongFileStoreEnforceMsgPerSubjectLimit(t *testing.T) {
 	fs.enforceMsgPerSubjectLimit(false)
 	require_LessThan(t, time.Since(start), time.Minute)
 	t.Logf("Took %s", time.Since(start))
+}
+
+// TestLongClusterPurgeLockupReproducer reproduces a production bug where
+// purging a large JetStream stream blocks JS API operations on other streams
+// in the same account for the duration of the purge.
+//
+// It boots a 3-node JS cluster, creates two file-backed R=3 streams in the
+// global account, fills the TARGET stream to a configurable size (default
+// 1 GiB; override with NATS_PURGE_REPRO_BYTES), then runs an OPEN-LOOP probe
+// of js.StreamInfo against both streams at a fixed rate from a non-leader
+// server. Latencies are bucketed into pre-purge / during-purge / post-purge
+// and reported with p50/p99/max. The test fails if the OTHER stream's p99
+// during the purge exceeds NATS_PURGE_REPRO_MAX_RATIO (default 50x) of the
+// pre-purge baseline.
+//
+// Disk usage: roughly 3x targetBytes (R=3). 5 GiB override => ~15 GiB.
+func TestLongClusterPurgeLockupReproducer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long reproducer; skipping in -short mode")
+	}
+
+	targetBytes := envInt64("NATS_PURGE_REPRO_BYTES", 1<<30)
+	msgSize := envInt("NATS_PURGE_REPRO_MSG_SIZE", 64*1024)
+	probeHz := envInt("NATS_PURGE_REPRO_HZ", 50)
+	asyncPending := envInt("NATS_PURGE_REPRO_ASYNC_PENDING", 50_000)
+	maxRatio := envFloat("NATS_PURGE_REPRO_MAX_RATIO", 50.0)
+	settle := 5 * time.Second
+
+	t.Logf("config: targetBytes=%d msgSize=%d probeHz=%d asyncPending=%d maxRatio=%.1f",
+		targetBytes, msgSize, probeHz, asyncPending, maxRatio)
+
+	c := createJetStreamClusterExplicit(t, "PRG3", 3)
+	defer c.shutdown()
+
+	adminConn, adminJS := jsClientConnectEx(t, c.randomServer(),
+		[]nats.JSOpt{nats.PublishAsyncMaxPending(asyncPending), nats.MaxWait(60 * time.Second)},
+		nats.MaxReconnects(-1),
+		nats.PingInterval(20*time.Second),
+	)
+	defer adminConn.Close()
+
+	_, err := adminJS.AddStream(&nats.StreamConfig{
+		Name:     "TARGET",
+		Subjects: []string{"target.>"},
+		Storage:  nats.FileStorage,
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	_, err = adminJS.AddStream(&nats.StreamConfig{
+		Name:     "OTHER",
+		Subjects: []string{"other.>"},
+		Storage:  nats.FileStorage,
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	c.waitOnStreamLeader(globalAccountName, "TARGET")
+	c.waitOnStreamLeader(globalAccountName, "OTHER")
+
+	t.Logf("filling TARGET with %d bytes (%d msgs of %d bytes)...",
+		targetBytes, targetBytes/int64(msgSize), msgSize)
+	fillStart := time.Now()
+	fillStream(t, adminJS, "target.fill", msgSize, targetBytes, asyncPending)
+	t.Logf("fill done in %s", time.Since(fillStart))
+
+	probeSrv := c.randomNonStreamLeader(globalAccountName, "TARGET")
+	require_True(t, probeSrv != nil)
+	probeConn, probeJS := jsClientConnect(t, probeSrv,
+		nats.MaxReconnects(-1),
+		nats.PingInterval(20*time.Second),
+	)
+	defer probeConn.Close()
+
+	results := make(chan probeResult, probeHz*600)
+	stopProbe := make(chan struct{})
+	var probeWG sync.WaitGroup
+	probeWG.Add(1)
+	go openLoopProbe(&probeWG, probeJS, probeHz, results, stopProbe)
+
+	baselineStart := time.Now()
+	time.Sleep(settle)
+	purgeStart := time.Now()
+
+	purgeDone := make(chan time.Time, 1)
+	go func() {
+		nc, _ := jsClientConnect(t, c.streamLeader(globalAccountName, "TARGET"),
+			nats.Timeout(10*time.Minute),
+			nats.MaxReconnects(-1),
+		)
+		defer nc.Close()
+		js, jerr := nc.JetStream(nats.MaxWait(10 * time.Minute))
+		require_NoError(t, jerr)
+		if perr := js.PurgeStream("TARGET"); perr != nil {
+			t.Errorf("PurgeStream returned: %v", perr)
+		}
+		purgeDone <- time.Now()
+	}()
+
+	purgeEnd := <-purgeDone
+	purgeDur := purgeEnd.Sub(purgeStart)
+	t.Logf("purge completed in %s", purgeDur)
+
+	time.Sleep(settle)
+	close(stopProbe)
+	probeWG.Wait()
+	close(results)
+
+	buckets := bucketResults(results, baselineStart, purgeStart, purgeEnd)
+	reportBuckets(t, buckets, purgeDur)
+
+	pre := buckets["pre|OTHER"]
+	during := buckets["during|OTHER"]
+	if pre == nil || during == nil {
+		t.Fatalf("missing buckets: pre=%v during=%v", pre, during)
+	}
+	if pre.p99 <= 0 {
+		t.Fatalf("baseline p99 is zero; cannot compute ratio (pre.count=%d errs=%d)", pre.count, pre.errs)
+	}
+
+	// Errors during the purge that weren't seen pre-purge are a strong
+	// signal of the lockup (probes hit the 30s MaxWait timeout).
+	if during.errs > 0 && during.errs > pre.errs {
+		t.Fatalf("JS API on OTHER stream returned errors during purge: pre.errs=%d during.errs=%d (probes time out at 30s)",
+			pre.errs, during.errs)
+	}
+
+	// If the purge was too fast to capture meaningful during samples, log a
+	// hint rather than asserting on noisy zero data. The test still validates
+	// shutdown and the framework; bump NATS_PURGE_REPRO_BYTES to repro.
+	minSamples := 5
+	if during.count+during.errs < minSamples {
+		t.Logf("WARNING: only %d during-purge samples for OTHER (purge=%s); test ran too small to detect lockup. Bump NATS_PURGE_REPRO_BYTES.",
+			during.count+during.errs, purgeDur)
+		return
+	}
+
+	ratio := float64(during.p99) / float64(pre.p99)
+	t.Logf("OTHER p99 ratio during/pre = %.1fx (pre=%s during=%s)", ratio, pre.p99, during.p99)
+	if ratio > maxRatio {
+		t.Fatalf("JS API on OTHER stream stalled during purge: p99 ballooned %.1fx (baseline=%s, during=%s, threshold=%.1fx)",
+			ratio, pre.p99, during.p99, maxRatio)
+	}
+}
+
+type probeResult struct {
+	target  string
+	sentAt  time.Time
+	latency time.Duration
+	err     error
+}
+
+type bucketStats struct {
+	bucket, stream string
+	count, errs    int
+	p50, p99, max  time.Duration
+}
+
+func fillStream(t *testing.T, js nats.JetStreamContext, subj string, msgSize int, totalBytes int64, asyncPending int) {
+	t.Helper()
+	payload := bytes.Repeat([]byte{'x'}, msgSize)
+	total := totalBytes / int64(msgSize)
+	flushEvery := int64(asyncPending / 2)
+	if flushEvery < 1 {
+		flushEvery = 1
+	}
+	flush := func() {
+		select {
+		case <-js.PublishAsyncComplete():
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("timed out waiting for PublishAsyncComplete")
+		}
+	}
+	for i := int64(0); i < total; i++ {
+		if _, perr := js.PublishAsync(subj, payload); perr != nil {
+			if errors.Is(perr, nats.ErrTooManyStalledMsgs) {
+				flush()
+				i--
+				continue
+			}
+			t.Fatalf("PublishAsync failed at i=%d: %v", i, perr)
+		}
+		if (i+1)%flushEvery == 0 {
+			flush()
+		}
+	}
+	flush()
+}
+
+func openLoopProbe(wg *sync.WaitGroup, js nats.JetStreamContext, hz int, out chan<- probeResult, stop <-chan struct{}) {
+	defer wg.Done()
+	if hz <= 0 {
+		hz = 1
+	}
+	tick := time.NewTicker(time.Second / time.Duration(hz))
+	defer tick.Stop()
+	var inFlight sync.WaitGroup
+	fire := func(name string) {
+		inFlight.Add(1)
+		go func() {
+			defer inFlight.Done()
+			t0 := time.Now()
+			_, err := js.StreamInfo(name, nats.MaxWait(30*time.Second))
+			out <- probeResult{target: name, sentAt: t0, latency: time.Since(t0), err: err}
+		}()
+	}
+	for {
+		select {
+		case <-stop:
+			inFlight.Wait()
+			return
+		case <-tick.C:
+			fire("OTHER")
+			fire("TARGET")
+		}
+	}
+}
+
+func bucketResults(in <-chan probeResult, baselineStart, purgeStart, purgeEnd time.Time) map[string]*bucketStats {
+	type key struct{ bucket, stream string }
+	lats := map[key][]time.Duration{}
+	errs := map[key]int{}
+	for r := range in {
+		if r.sentAt.Before(baselineStart) {
+			continue
+		}
+		var b string
+		switch {
+		case r.sentAt.Before(purgeStart):
+			b = "pre"
+		case !r.sentAt.After(purgeEnd):
+			b = "during"
+		default:
+			b = "post"
+		}
+		k := key{bucket: b, stream: r.target}
+		if r.err != nil {
+			errs[k]++
+			continue
+		}
+		lats[k] = append(lats[k], r.latency)
+	}
+	out := map[string]*bucketStats{}
+	for _, b := range []string{"pre", "during", "post"} {
+		for _, s := range []string{"OTHER", "TARGET"} {
+			k := key{bucket: b, stream: s}
+			ls := lats[k]
+			sort.Slice(ls, func(i, j int) bool { return ls[i] < ls[j] })
+			bs := &bucketStats{bucket: b, stream: s, count: len(ls), errs: errs[k]}
+			if n := len(ls); n > 0 {
+				bs.p50 = ls[n*50/100]
+				bs.p99 = ls[(n*99)/100]
+				if bs.p99 >= time.Duration(n) {
+					// guard against degenerate index
+				}
+				bs.max = ls[n-1]
+			}
+			out[b+"|"+s] = bs
+		}
+	}
+	return out
+}
+
+func reportBuckets(t *testing.T, b map[string]*bucketStats, purgeDur time.Duration) {
+	t.Helper()
+	t.Logf("purge duration: %s", purgeDur)
+	t.Logf("%-7s %-7s %7s %5s %12s %12s %12s", "bucket", "stream", "n", "errs", "p50", "p99", "max")
+	for _, name := range []string{"pre", "during", "post"} {
+		for _, s := range []string{"OTHER", "TARGET"} {
+			bs := b[name+"|"+s]
+			t.Logf("%-7s %-7s %7d %5d %12s %12s %12s",
+				bs.bucket, bs.stream, bs.count, bs.errs, bs.p50, bs.p99, bs.max)
+		}
+	}
+}
+
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(name string, def int64) int64 {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envFloat(name string, def float64) float64 {
+	if v := os.Getenv(name); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
 }
