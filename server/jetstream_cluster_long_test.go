@@ -1261,8 +1261,11 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 	t.Logf("filling TARGET with %d bytes (%d msgs of %d bytes)...",
 		targetBytes, targetBytes/int64(msgSize), msgSize)
 	fillStart := time.Now()
-	fillStream(t, adminJS, "target.fill", msgSize, targetBytes, asyncPending)
-	t.Logf("fill done in %s", time.Since(fillStart))
+	fillWorkers := envInt("NATS_PURGE_REPRO_FILL_WORKERS", 8)
+	fillStreamParallel(t, c.streamLeader(globalAccountName, "TARGET"),
+		"target.fill", msgSize, targetBytes, asyncPending, fillWorkers)
+	t.Logf("fill done in %s (%.1f MiB/s)", time.Since(fillStart),
+		float64(targetBytes)/(1024*1024)/time.Since(fillStart).Seconds())
 
 	probeSrv := c.randomNonStreamLeader(globalAccountName, "TARGET")
 	require_True(t, probeSrv != nil)
@@ -1376,35 +1379,86 @@ type bucketStats struct {
 	p50, p99, max  time.Duration
 }
 
-func fillStream(t *testing.T, js nats.JetStreamContext, subj string, msgSize int, totalBytes int64, asyncPending int) {
+// fillStreamParallel publishes totalBytes worth of msgSize-byte messages to
+// subj using `workers` parallel goroutines, each on its own connection+JS
+// context targeted at the stream leader. This pattern (see
+// BenchmarkJetStreamPublishConcurrent in jetstream_benchmark_test.go) keeps
+// the leader's Raft proposal pipeline saturated without depending on one
+// publisher goroutine's scheduling latency. Connecting directly to the
+// leader avoids an extra forwarding hop.
+func fillStreamParallel(t *testing.T, leader *Server, subj string, msgSize int, totalBytes int64, asyncPending, workers int) {
 	t.Helper()
-	payload := bytes.Repeat([]byte{'x'}, msgSize)
-	total := totalBytes / int64(msgSize)
-	flushEvery := int64(asyncPending / 2)
-	if flushEvery < 1 {
-		flushEvery = 1
+	if workers < 1 {
+		workers = 1
 	}
-	flush := func() {
-		select {
-		case <-js.PublishAsyncComplete():
-		case <-time.After(10 * time.Minute):
-			t.Fatalf("timed out waiting for PublishAsyncComplete")
+	totalMsgs := totalBytes / int64(msgSize)
+	perWorker := totalMsgs / int64(workers)
+	remainder := totalMsgs % int64(workers)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for w := 0; w < workers; w++ {
+		count := perWorker
+		if int64(w) < remainder {
+			count++
 		}
-	}
-	for i := int64(0); i < total; i++ {
-		if _, perr := js.PublishAsync(subj, payload); perr != nil {
-			if errors.Is(perr, nats.ErrTooManyStalledMsgs) {
-				flush()
-				i--
-				continue
+		if count == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(workerID int, n int64) {
+			defer wg.Done()
+			nc, js := jsClientConnectEx(t, leader,
+				[]nats.JSOpt{nats.PublishAsyncMaxPending(asyncPending), nats.MaxWait(60 * time.Second)},
+				nats.MaxReconnects(-1),
+				nats.PingInterval(20*time.Second),
+			)
+			defer nc.Close()
+
+			payload := bytes.Repeat([]byte{'x'}, msgSize)
+			flushEvery := int64(asyncPending / 2)
+			if flushEvery < 1 {
+				flushEvery = 1
 			}
-			t.Fatalf("PublishAsync failed at i=%d: %v", i, perr)
-		}
-		if (i+1)%flushEvery == 0 {
+			flush := func() bool {
+				select {
+				case <-js.PublishAsyncComplete():
+					return true
+				case <-time.After(10 * time.Minute):
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("worker %d: timed out waiting for PublishAsyncComplete", workerID)
+					})
+					return false
+				}
+			}
+			for i := int64(0); i < n; i++ {
+				if _, perr := js.PublishAsync(subj, payload); perr != nil {
+					if errors.Is(perr, nats.ErrTooManyStalledMsgs) {
+						if !flush() {
+							return
+						}
+						i--
+						continue
+					}
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("worker %d: PublishAsync at i=%d: %w", workerID, i, perr)
+					})
+					return
+				}
+				if (i+1)%flushEvery == 0 {
+					if !flush() {
+						return
+					}
+				}
+			}
 			flush()
-		}
+		}(w, count)
 	}
-	flush()
+	wg.Wait()
+	if firstErr != nil {
+		t.Fatalf("fillStreamParallel: %v", firstErr)
+	}
 }
 
 func openLoopProbe(wg *sync.WaitGroup, js nats.JetStreamContext, hz int, out chan<- probeResult, stop <-chan struct{}) {
