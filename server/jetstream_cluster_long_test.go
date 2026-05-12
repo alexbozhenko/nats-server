@@ -1278,9 +1278,19 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 	probeWG.Add(1)
 	go openLoopProbe(&probeWG, probeJS, probeHz, results, stopProbe)
 
+	// Live latency snapshot goroutine: drains results in real time, stores
+	// them for end-of-test bucketing, and every snapshotEvery prints a
+	// rolling-window p50/p99/max so the lockup can be watched live with
+	// `go test -v`.
+	snapshotEvery := envDuration("NATS_PURGE_REPRO_SNAPSHOT", time.Second)
+	allResults := make([]probeResult, 0, probeHz*600)
+	collectorDone := make(chan struct{})
+	go collectAndReport(t, results, snapshotEvery, &allResults, collectorDone)
+
 	baselineStart := time.Now()
 	time.Sleep(preWin)
 	purgeStart := time.Now()
+	t.Logf("=== purge starting ===")
 
 	purgeDone := make(chan time.Time, 1)
 	go func() {
@@ -1299,14 +1309,15 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 
 	purgeEnd := <-purgeDone
 	purgeDur := purgeEnd.Sub(purgeStart)
-	t.Logf("purge completed in %s", purgeDur)
+	t.Logf("=== purge API returned after %s (async block deletion may continue) ===", purgeDur)
 
 	time.Sleep(postWin)
 	close(stopProbe)
 	probeWG.Wait()
 	close(results)
+	<-collectorDone
 
-	buckets := bucketResults(results, baselineStart, purgeStart, purgeEnd)
+	buckets := bucketResultsSlice(allResults, baselineStart, purgeStart, purgeEnd)
 	reportBuckets(t, buckets, purgeDur)
 
 	pre := buckets["pre|OTHER"]
@@ -1425,11 +1436,72 @@ func openLoopProbe(wg *sync.WaitGroup, js nats.JetStreamContext, hz int, out cha
 	}
 }
 
-func bucketResults(in <-chan probeResult, baselineStart, purgeStart, purgeEnd time.Time) map[string]*bucketStats {
+// collectAndReport drains results in real time, storing every result into
+// the slice for end-of-test analysis while also emitting a rolling-window
+// summary every `every` so the lockup is observable live under `go test -v`.
+func collectAndReport(t *testing.T, in <-chan probeResult, every time.Duration, store *[]probeResult, done chan<- struct{}) {
+	defer close(done)
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	type row struct {
+		latsOther, latsTarget []time.Duration
+		errsOther, errsTarget int
+	}
+	window := row{}
+	emit := func() {
+		summarize := func(name string, lats []time.Duration, errs int) {
+			if len(lats) == 0 && errs == 0 {
+				t.Logf("  %-7s no samples", name)
+				return
+			}
+			sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+			var p50, p99, mx time.Duration
+			if n := len(lats); n > 0 {
+				p50 = lats[n*50/100]
+				p99 = lats[(n*99)/100]
+				mx = lats[n-1]
+			}
+			t.Logf("  %-7s n=%4d errs=%2d p50=%-10s p99=%-10s max=%-10s",
+				name, len(lats), errs, p50, p99, mx)
+		}
+		summarize("OTHER", window.latsOther, window.errsOther)
+		summarize("TARGET", window.latsTarget, window.errsTarget)
+		window = row{}
+	}
+	for {
+		select {
+		case r, ok := <-in:
+			if !ok {
+				emit() // final partial window
+				return
+			}
+			*store = append(*store, r)
+			switch r.target {
+			case "OTHER":
+				if r.err != nil {
+					window.errsOther++
+				} else {
+					window.latsOther = append(window.latsOther, r.latency)
+				}
+			case "TARGET":
+				if r.err != nil {
+					window.errsTarget++
+				} else {
+					window.latsTarget = append(window.latsTarget, r.latency)
+				}
+			}
+		case <-tick.C:
+			t.Logf("[t=%s]", time.Now().Format("15:04:05"))
+			emit()
+		}
+	}
+}
+
+func bucketResultsSlice(rs []probeResult, baselineStart, purgeStart, purgeEnd time.Time) map[string]*bucketStats {
 	type key struct{ bucket, stream string }
 	lats := map[key][]time.Duration{}
 	errs := map[key]int{}
-	for r := range in {
+	for _, r := range rs {
 		if r.sentAt.Before(baselineStart) {
 			continue
 		}
@@ -1459,9 +1531,6 @@ func bucketResults(in <-chan probeResult, baselineStart, purgeStart, purgeEnd ti
 			if n := len(ls); n > 0 {
 				bs.p50 = ls[n*50/100]
 				bs.p99 = ls[(n*99)/100]
-				if bs.p99 >= time.Duration(n) {
-					// guard against degenerate index
-				}
 				bs.max = ls[n-1]
 			}
 			out[b+"|"+s] = bs
