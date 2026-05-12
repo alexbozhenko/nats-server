@@ -1219,10 +1219,16 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 	probeHz := envInt("NATS_PURGE_REPRO_HZ", 50)
 	asyncPending := envInt("NATS_PURGE_REPRO_ASYNC_PENDING", 50_000)
 	maxRatio := envFloat("NATS_PURGE_REPRO_MAX_RATIO", 50.0)
-	settle := 5 * time.Second
+	preWin := envDuration("NATS_PURGE_REPRO_PRE_WINDOW", 5*time.Second)
+	// The API call returns as soon as Raft commit is acknowledged, but the
+	// async file-store block deletion continues afterwards and is where the
+	// real lockup is observed in production (user's nats CLI hit a 60s
+	// timeout while the lockup continued for ~17 min). Extend the post-purge
+	// observation window significantly so we measure that tail.
+	postWin := envDuration("NATS_PURGE_REPRO_POST_WINDOW", 60*time.Second)
 
-	t.Logf("config: targetBytes=%d msgSize=%d probeHz=%d asyncPending=%d maxRatio=%.1f",
-		targetBytes, msgSize, probeHz, asyncPending, maxRatio)
+	t.Logf("config: targetBytes=%d msgSize=%d probeHz=%d asyncPending=%d maxRatio=%.1f preWin=%s postWin=%s",
+		targetBytes, msgSize, probeHz, asyncPending, maxRatio, preWin, postWin)
 
 	c := createJetStreamClusterExplicit(t, "PRG3", 3)
 	defer c.shutdown()
@@ -1273,7 +1279,7 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 	go openLoopProbe(&probeWG, probeJS, probeHz, results, stopProbe)
 
 	baselineStart := time.Now()
-	time.Sleep(settle)
+	time.Sleep(preWin)
 	purgeStart := time.Now()
 
 	purgeDone := make(chan time.Time, 1)
@@ -1295,7 +1301,7 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 	purgeDur := purgeEnd.Sub(purgeStart)
 	t.Logf("purge completed in %s", purgeDur)
 
-	time.Sleep(settle)
+	time.Sleep(postWin)
 	close(stopProbe)
 	probeWG.Wait()
 	close(results)
@@ -1305,36 +1311,45 @@ func TestLongClusterPurgeLockupReproducer(t *testing.T) {
 
 	pre := buckets["pre|OTHER"]
 	during := buckets["during|OTHER"]
-	if pre == nil || during == nil {
-		t.Fatalf("missing buckets: pre=%v during=%v", pre, during)
+	post := buckets["post|OTHER"]
+	if pre == nil || during == nil || post == nil {
+		t.Fatalf("missing buckets: pre=%v during=%v post=%v", pre, during, post)
 	}
 	if pre.p99 <= 0 {
 		t.Fatalf("baseline p99 is zero; cannot compute ratio (pre.count=%d errs=%d)", pre.count, pre.errs)
 	}
 
-	// Errors during the purge that weren't seen pre-purge are a strong
-	// signal of the lockup (probes hit the 30s MaxWait timeout).
-	if during.errs > 0 && during.errs > pre.errs {
+	// Errors that weren't seen pre-purge are a strong signal of the lockup
+	// (probes hit the 30s MaxWait timeout). Check both during and post, since
+	// the API call returns as soon as Raft commits but the async block
+	// deletion continues afterwards.
+	if during.errs > pre.errs {
 		t.Fatalf("JS API on OTHER stream returned errors during purge: pre.errs=%d during.errs=%d (probes time out at 30s)",
 			pre.errs, during.errs)
 	}
-
-	// If the purge was too fast to capture meaningful during samples, log a
-	// hint rather than asserting on noisy zero data. The test still validates
-	// shutdown and the framework; bump NATS_PURGE_REPRO_BYTES to repro.
-	minSamples := 5
-	if during.count+during.errs < minSamples {
-		t.Logf("WARNING: only %d during-purge samples for OTHER (purge=%s); test ran too small to detect lockup. Bump NATS_PURGE_REPRO_BYTES.",
-			during.count+during.errs, purgeDur)
-		return
+	if post.errs > pre.errs {
+		t.Fatalf("JS API on OTHER stream returned errors post-purge: pre.errs=%d post.errs=%d (probes time out at 30s)",
+			pre.errs, post.errs)
 	}
 
-	ratio := float64(during.p99) / float64(pre.p99)
-	t.Logf("OTHER p99 ratio during/pre = %.1fx (pre=%s during=%s)", ratio, pre.p99, during.p99)
-	if ratio > maxRatio {
-		t.Fatalf("JS API on OTHER stream stalled during purge: p99 ballooned %.1fx (baseline=%s, during=%s, threshold=%.1fx)",
-			ratio, pre.p99, during.p99, maxRatio)
+	// Compare both during and post buckets to baseline. Post is often where
+	// the real impact shows up because async block deletion runs after the
+	// API returns.
+	checkRatio := func(name string, b *bucketStats) {
+		if b.count < 5 {
+			t.Logf("WARNING: only %d %s samples for OTHER (purge=%s); skipping ratio check. Bump NATS_PURGE_REPRO_BYTES / windows.",
+				b.count, name, purgeDur)
+			return
+		}
+		ratio := float64(b.p99) / float64(pre.p99)
+		t.Logf("OTHER p99 ratio %s/pre = %.1fx (pre=%s %s=%s)", name, ratio, pre.p99, name, b.p99)
+		if ratio > maxRatio {
+			t.Errorf("JS API on OTHER stream stalled %s purge: p99 ballooned %.1fx (baseline=%s, %s=%s, threshold=%.1fx)",
+				name, ratio, pre.p99, name, b.p99, maxRatio)
+		}
 	}
+	checkRatio("during", during)
+	checkRatio("post", post)
 }
 
 type probeResult struct {
@@ -1490,6 +1505,15 @@ func envFloat(name string, def float64) float64 {
 	if v := os.Getenv(name); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			return f
+		}
+	}
+	return def
+}
+
+func envDuration(name string, def time.Duration) time.Duration {
+	if v := os.Getenv(name); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
 	return def
